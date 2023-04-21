@@ -157,6 +157,9 @@ public class BPGApplication extends Application<AppConfig> {
     final BPGHealthCheck healthCheck = new BPGHealthCheck(configuration.getSparkClusters());
     environment.healthChecks().register("sparkClusters", healthCheck);
 
+    final NotaryRest notaryRest = new NotaryRest(configuration, meterRegistry);
+    environment.jersey().register(notaryRest);
+
     // Support OpenAPI spec for all components under com.apple.spark.rest
     OpenAPI openAPI = new OpenAPI();
     SwaggerConfiguration oasConfig =

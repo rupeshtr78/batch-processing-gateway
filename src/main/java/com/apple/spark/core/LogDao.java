@@ -164,6 +164,43 @@ public class LogDao {
     return queryResult;
   }
 
+    private String getUserFromSubmissionIdImpl(String submissionId) {
+    String queryResult = "";
+
+    String sql =
+            String.format(
+                    "SELECT user from %s.application_submission where submission_id = ?", dbName);
+
+    try (PreparedStatement statement = dbConnection.getConnection().prepareStatement(sql)) {
+      statement.setString(1, submissionId);
+      try (ResultSet resultSet = statement.executeQuery()) {
+        boolean seenResult = false;
+        while (resultSet.next()) {
+          if (seenResult) {
+            logger.warn(String.format("Found multiple records for the same submissionId: %s"), submissionId);
+            queryResult = "";
+            break;
+          }
+
+          Object object = resultSet.getObject("user");
+          if (object == null) {
+            queryResult = "";
+          } else {
+            queryResult = object.toString();
+          }
+          seenResult = true;
+        }
+      }
+    } catch (Throwable ex) {
+      logger.warn(String.format("Failed to execute SQL query: %s", sql), ex);
+      failureMetrics.increment(
+              DB_FAILURE_METRIC_NAME,
+              Tag.of(OPERATION_TAG, QUERY_SUBMISSION_OPERATION),
+              Tag.of(EXCEPTION_TAG, ex.getClass().getSimpleName()));
+    }
+    return queryResult;
+  }
+
   public void logApplicationSubmission(
       String submissionId, String user, SubmitApplicationRequest submission) {
     if (bypassLog) {
