@@ -19,21 +19,13 @@
 
 package com.apple.spark.rest;
 
-import static com.apple.spark.core.ApplicationSubmissionHelper.getDriverSpec;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getExecutorSpec;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getImage;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getProxyUser;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getSparkConf;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getSparkUIConfiguration;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getType;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getVolumes;
-import static com.apple.spark.core.ApplicationSubmissionHelper.getYuniKornSchedulerConfig;
+import static com.apple.spark.core.ApplicationSubmissionHelper.*;
 import static com.apple.spark.core.BatchSchedulerConstants.YUNIKORN_ROOT_QUEUE;
 import static com.apple.spark.core.BatchSchedulerConstants.YUNIKORN_SCHEDULER;
 import static com.apple.spark.core.Constants.*;
+import static com.apple.spark.core.MonitoringConstants.ENABLE_METRICS_CONF;
 
 import com.apple.spark.AppConfig;
-import com.apple.spark.AppConfig.SparkCluster;
 import com.apple.spark.api.DeleteSubmissionResponse;
 import com.apple.spark.api.GetDriverInfoResponse;
 import com.apple.spark.api.GetMySubmissionsResponse;
@@ -41,12 +33,11 @@ import com.apple.spark.api.GetSubmissionStatusResponse;
 import com.apple.spark.api.SubmissionSummary;
 import com.apple.spark.api.SubmitApplicationRequest;
 import com.apple.spark.api.SubmitApplicationResponse;
+import com.apple.spark.appleinternal.AppleKerberosUtil;
+import com.apple.spark.appleinternal.AppleNotaryUtil;
 import com.apple.spark.core.*;
-import com.apple.spark.operator.DriverInfo;
-import com.apple.spark.operator.SparkApplicationResource;
-import com.apple.spark.operator.SparkApplicationResourceDoneable;
-import com.apple.spark.operator.SparkApplicationResourceList;
-import com.apple.spark.operator.SparkApplicationSpec;
+import com.apple.spark.crd.VirtualSparkClusterSpec;
+import com.apple.spark.operator.*;
 import com.apple.spark.security.User;
 import com.apple.spark.util.ConfigUtil;
 import com.apple.spark.util.CustomSerDe;
@@ -64,11 +55,10 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import io.dropwizard.auth.Auth;
-import io.fabric8.kubernetes.api.model.Event;
-import io.fabric8.kubernetes.api.model.EventList;
-import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.PodStatus;
-import io.fabric8.kubernetes.client.DefaultKubernetesClient;
+import io.fabric8.kubernetes.api.model.*;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.MixedOperation;
+import io.fabric8.kubernetes.client.dsl.Resource;
 import io.fabric8.kubernetes.client.dsl.base.CustomResourceDefinitionContext;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
@@ -81,12 +71,7 @@ import io.swagger.v3.oas.annotations.parameters.RequestBody;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.security.PermitAll;
@@ -108,7 +93,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @PermitAll
-@Path(SPARK_API_V2)
+@Path(SPARK_API)
 @Produces(MediaType.APPLICATION_JSON)
 public class ApplicationSubmissionRest extends RestBase {
 
@@ -151,7 +136,7 @@ public class ApplicationSubmissionRest extends RestBase {
           @Override
           public GetSubmissionStatusResponseCacheValue load(String submissionId) {
             requestCounters.increment(STATUS_CACHE_LOAD);
-            AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+            VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
             try {
               GetSubmissionStatusResponse response =
                   getStatusImplWithoutCache(submissionId, sparkCluster);
@@ -252,7 +237,7 @@ public class ApplicationSubmissionRest extends RestBase {
     validateSubmissionRequest(request);
 
     // choose Spark cluster to submit the job to
-    AppConfig.SparkCluster sparkCluster =
+    VirtualSparkClusterSpec sparkCluster =
         SparkClusterHelper.chooseSparkCluster(appConfig, request, user.getName());
 
     String sparkVersionTagValue =
@@ -274,13 +259,24 @@ public class ApplicationSubmissionRest extends RestBase {
     String parentQueue = SparkClusterHelper.getParentQueue(queue);
     String queueTagValue = queue == null ? "" : queue;
 
+    // Reject GPU jobs submitted to non-GPU queues
+    validateGpuRequest(request, queue);
+
+    // Populate Prometheus monitoring configs into the request
+    if (request.getSparkConf() != null
+        && Boolean.parseBoolean(request.getSparkConf().get(ENABLE_METRICS_CONF))) {
+      logger.info("Detected enable_metrics=true, the Spark job JMX metrics will be exported");
+      populatePrometheusMonitoring(request);
+      populatePrometheusAnnotations(request);
+    }
+
     // the Spark spec to be submitted to Spark cluster
     SparkApplicationSpec.Builder specBuilder =
         new SparkApplicationSpec.Builder()
             .withMode(SparkConstants.CLUSTER_MODE)
             .withOriginalUser(user.getName())
-            .withProxyUser(proxyUser)
             .withType(type)
+            .withProxyUser(proxyUser)
             .withSparkVersion(sparkVersion)
             .withMainClass(request.getMainClass())
             .withMainApplicationFile(request.getMainApplicationFile())
@@ -292,12 +288,14 @@ public class ApplicationSubmissionRest extends RestBase {
             .withRestartPolicy(request.getRestartPolicy())
             .withVolumes(request.getVolumes())
             .withDeps(request.getDeps())
+            .withMonitoringSpec(request.getMonitoring())
             .withPythonVersion(request.getPythonVersion())
             .withTimeToLiveSeconds(sparkCluster.getTtlSeconds())
             .extendSparkConf(
                 getSparkConf(submissionId, request, appConfig.getDefaultSparkConf(), sparkCluster))
             .withSparkUIConfiguration(getSparkUIConfiguration(submissionId, sparkCluster))
-            .extendVolumes(getVolumes(request, sparkCluster));
+            .extendVolumes(getVolumes(request, sparkCluster))
+            .extendVolumeMounts(getVolumeMounts(request, sparkCluster));
 
     // only set scheduler if it's YuniKorn
     String batchScheduler = sparkCluster.getBatchScheduler();
@@ -318,6 +316,13 @@ public class ApplicationSubmissionRest extends RestBase {
     // Set environment variables
     ApplicationSubmissionHelper.populateEnv(sparkSpec, request, sparkCluster);
 
+    if (sparkSpec.getSparkConf() != null) {
+      String disableProxyUserConfValue = sparkSpec.getSparkConf().get(Constants.DISABLE_PROXY_USER);
+      if (disableProxyUserConfValue != null && disableProxyUserConfValue.equalsIgnoreCase("true")) {
+        sparkSpec.setProxyUser(null);
+      }
+    }
+
     requestCounters.increment(
         REQUEST_METRIC_NAME,
         Tag.of("name", "submit_application"),
@@ -327,51 +332,56 @@ public class ApplicationSubmissionRest extends RestBase {
         Tag.of("spark_cluster", sparkCluster.getId()),
         Tag.of("queue", queueTagValue));
 
-    logDao.logApplicationSubmission(submissionId, sparkSpec.getProxyUser(), request);
+    // Setting a default Spark conf to support spark query listener
+    // rdar://98086206 (Hot fix: Enable spark listener for the latest Spark 3.2 image)
+    // This should only be set when default spark images are used
+    // TODO: clean this up and make this configurable in Skate config
+    if (request.getImage() == null || request.getImage().isEmpty()) {
+      applyQueryListenerSparkConf(sparkSpec);
+    }
+
+    logDao.logApplicationSubmission(submissionId, proxyUser, request);
     SubmitApplicationResponse response =
-        submitSparkCRD(sparkCluster, submissionId, sparkSpec, request, queue, parentQueue);
+        submitSparkCRD(
+            sparkCluster, submissionId, sparkSpec, request, queue, parentQueue, proxyUser);
     return response;
   }
 
   private SubmitApplicationResponse submitSparkCRD(
-      SparkCluster sparkCluster,
+      VirtualSparkClusterSpec sparkCluster,
       String submissionId,
       SparkApplicationSpec sparkSpec,
       SubmitApplicationRequest request,
       String queue,
-      String parentQueue) {
+      String parentQueue,
+      String proxyUser) {
     com.codahale.metrics.Timer timer =
         registry.timer(this.getClass().getSimpleName() + ".submitApplication.k8s-time");
 
-    try (DefaultKubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
+    try (KubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
         com.codahale.metrics.Timer.Context context = timer.time()) {
-      SparkApplicationResource sparkApplicationResource = new SparkApplicationResource();
-      sparkApplicationResource.setApiVersion(SparkConstants.SPARK_OPERATOR_API_VERSION);
-      sparkApplicationResource.setKind(SparkConstants.SPARK_APPLICATION_KIND);
-      sparkApplicationResource.getMetadata().setName(submissionId);
-      sparkApplicationResource
-          .getMetadata()
-          .setNamespace(sparkCluster.getSparkApplicationNamespace());
+      SparkApplication sparkApplication = new SparkApplication();
+      sparkApplication.setApiVersion(SparkConstants.SPARK_OPERATOR_API_VERSION);
+      sparkApplication.setKind(SparkConstants.SPARK_APPLICATION_KIND);
+      sparkApplication.getMetadata().setName(submissionId);
+      sparkApplication.getMetadata().setNamespace(sparkCluster.getSparkApplicationNamespace());
 
-      if (sparkApplicationResource.getMetadata().getLabels() == null) {
-        sparkApplicationResource.getMetadata().setLabels(new HashMap<>());
+      if (sparkApplication.getMetadata().getLabels() == null) {
+        sparkApplication.getMetadata().setLabels(new HashMap<>());
       }
-      if (sparkSpec.getProxyUser() != null) {
-        sparkApplicationResource
-            .getMetadata()
-            .getLabels()
-            .put(PROXY_USER_LABEL, sparkSpec.getProxyUser());
+      if (proxyUser != null) {
+        sparkApplication.getMetadata().getLabels().put(PROXY_USER_LABEL, proxyUser);
       }
       if (request.getApplicationName() != null) {
         String applicationNameLabelValue =
             KubernetesHelper.normalizeLabelValue(request.getApplicationName());
-        sparkApplicationResource
+        sparkApplication
             .getMetadata()
             .getLabels()
             .put(APPLICATION_NAME_LABEL, applicationNameLabelValue);
       }
 
-      sparkApplicationResource
+      sparkApplication
           .getMetadata()
           .getLabels()
           .put(QUEUE_LABEL, YUNIKORN_ROOT_QUEUE + "." + queue);
@@ -400,10 +410,47 @@ public class ApplicationSubmissionRest extends RestBase {
           }
         }
       }
-      sparkApplicationResource
+      sparkApplication
           .getMetadata()
           .getLabels()
           .put(MAX_RUNNING_MILLIS_LABEL, String.valueOf(maxRunningMillis));
+
+      if (request.getSpotInstance()) {
+        long spotTimeoutMillis = getMaxRunningMillisForQueue(parentQueue);
+        // check spot timeout setting from request
+        if (request.getSparkConf() != null) {
+          String confValue = request.getSpotTimeoutMillis();
+          if (confValue != null && !confValue.isEmpty()) {
+            try {
+              spotTimeoutMillis = Long.parseLong(confValue);
+            } catch (Throwable ex) {
+              throw new WebApplicationException(
+                  String.format(
+                      "Invalid value for config %s: %s", Constants.SPOT_TIMEOUT_LABEL, confValue),
+                  Response.Status.BAD_REQUEST);
+            }
+            // make sure spot timeout not exceed the configured value for the queue
+            long maxRunningMillisForQueue = getMaxRunningMillisForQueue(parentQueue);
+            if (maxRunningMillisForQueue < spotTimeoutMillis) {
+              throw new WebApplicationException(
+                  String.format(
+                      "spotTimeoutMillis %s is too large than allowed %s for queue %s",
+                      spotTimeoutMillis, maxRunningMillisForQueue, queue),
+                  Response.Status.BAD_REQUEST);
+            }
+          }
+        }
+
+        sparkApplication
+            .getMetadata()
+            .getLabels()
+            .put(SPOT_INSTANCE_LABEL, String.valueOf(request.getSpotInstance()));
+
+        sparkApplication
+            .getMetadata()
+            .getLabels()
+            .put(SPOT_TIMEOUT_LABEL, String.valueOf(spotTimeoutMillis));
+      }
 
       try {
         String sparkSpecJson = CustomSerDe.sparkSpecToNonSensitiveJson(sparkSpec);
@@ -412,15 +459,48 @@ public class ApplicationSubmissionRest extends RestBase {
         logger.warn("Failed to serialize SparkApplicationSpec and mask sensitive info", ex);
       }
 
-      sparkApplicationResource.setSpec(sparkSpec);
+      // The following line is for Apple only, and should be excluded from Open Source Upstream
+      AppleKerberosUtil.enableKerberosSupport(
+          sparkSpec, request, appConfig, proxyUser, timerMetrics);
+
+      AppConfig.QueueConfig queueConfig = null;
+      if (appConfig.getQueues() != null) {
+        Optional<AppConfig.QueueConfig> optional =
+            appConfig.getQueues().stream()
+                .filter(t -> t.getName() != null && t.getName().equals(queue))
+                .findFirst();
+        if (optional.isPresent()) {
+          queueConfig = optional.get();
+        }
+      }
+
+
+      // Notary token support
+      try {
+
+        String notaryAppIdEnvVar = AppleNotaryUtil.BPG_NOTARY_APP_ID;
+
+          if (!AppleNotaryUtil.checkNotaryApplication(notaryAppIdEnvVar)) {
+            logger.warn("Token not generated not a valid notary application");
+          } else {
+            AppleNotaryUtil.enableNotaryEnvironmentVariable(sparkApplication,sparkSpec);
+            logger.info("Notary token generated");
+          }
+      } catch (Exception ex) {
+        logger.warn("Failed to create Notary Token", ex);
+      }
+
+
+      AwsCredentialSparkConfigProvider.addAwsCredentialSparkConfig(sparkSpec, queueConfig);
       CustomResourceDefinitionContext crdContext = KubernetesHelper.getSparkApplicationCrdContext();
-      client
-          .customResources(
-              crdContext,
-              SparkApplicationResource.class,
-              SparkApplicationResourceList.class,
-              SparkApplicationResourceDoneable.class)
-          .create(sparkApplicationResource);
+
+      sparkApplication.setSpec(sparkSpec);
+
+      MixedOperation<SparkApplication, SparkApplicationResourceList, Resource<SparkApplication>>
+          sparkApplicationClient =
+              client.resources(SparkApplication.class, SparkApplicationResourceList.class);
+
+      sparkApplicationClient.create(sparkApplication);
 
       SubmitApplicationResponse response = new SubmitApplicationResponse();
       response.setSubmissionId(submissionId);
@@ -462,21 +542,21 @@ public class ApplicationSubmissionRest extends RestBase {
     requestCounters.increment(
         REQUEST_METRIC_NAME, Tag.of("name", "delete_submission"), Tag.of("user", user.getName()));
 
-    AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+    VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
     com.codahale.metrics.Timer timer =
         registry.timer(this.getClass().getSimpleName() + ".deleteSubmission.k8s-time");
-    try (DefaultKubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
+    try (KubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
         com.codahale.metrics.Timer.Context context = timer.time()) {
       CustomResourceDefinitionContext crdContext = KubernetesHelper.getSparkApplicationCrdContext();
-      client
-          .customResources(
-              crdContext,
-              SparkApplicationResource.class,
-              SparkApplicationResourceList.class,
-              SparkApplicationResourceDoneable.class)
+      MixedOperation<SparkApplication, SparkApplicationResourceList, Resource<SparkApplication>>
+          sparkApplicationClient =
+              client.resources(SparkApplication.class, SparkApplicationResourceList.class);
+
+      sparkApplicationClient
           .inNamespace(sparkCluster.getSparkApplicationNamespace())
           .withName(submissionId)
           .delete();
+
       context.stop();
       return new DeleteSubmissionResponse();
     }
@@ -515,9 +595,8 @@ public class ApplicationSubmissionRest extends RestBase {
         clientVersion);
     requestCounters.increment(
         REQUEST_METRIC_NAME, Tag.of("name", "get_spec"), Tag.of("user", user.getName()));
-    SparkApplicationResource sparkApplicationResource = getSparkApplicationResource(submissionId);
-    SparkApplicationSpec sparkApplicationSpec =
-        removeEnvFromSpec(sparkApplicationResource.getSpec());
+    SparkApplication sparkApplication = getSparkApplicationResource(submissionId);
+    SparkApplicationSpec sparkApplicationSpec = removeEnvFromSpec(sparkApplication.getSpec());
     return sparkApplicationSpec;
   }
 
@@ -560,13 +639,13 @@ public class ApplicationSubmissionRest extends RestBase {
       requestCounters.increment(
           STATUS_CACHE_GET_FAILURE, Tag.of("exception", ex.getClass().getSimpleName()));
       logger.warn(String.format("Failed to get status from cache for %s", submissionId), ex);
-      AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+      VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
       return getStatusImplWithoutCache(submissionId, sparkCluster);
     }
 
     if (cacheValue == null) {
       logger.warn("Got null status cache value for {}", submissionId);
-      AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+      VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
       return getStatusImplWithoutCache(submissionId, sparkCluster);
     }
 
@@ -577,7 +656,7 @@ public class ApplicationSubmissionRest extends RestBase {
     if (cacheElapsedTime > statusCacheExpireMillis * 2) {
       logger.warn(
           "Got expired status cache value ({} millis) for {}", cacheElapsedTime, submissionId);
-      AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+      VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
       return getStatusImplWithoutCache(submissionId, sparkCluster);
     }
 
@@ -603,23 +682,21 @@ public class ApplicationSubmissionRest extends RestBase {
   }
 
   private GetSubmissionStatusResponse getStatusImplWithoutCache(
-      String submissionId, AppConfig.SparkCluster sparkCluster) {
+      String submissionId, VirtualSparkClusterSpec sparkCluster) {
     com.codahale.metrics.Timer timer =
         registry.timer(this.getClass().getSimpleName() + ".getStatus.k8s-time");
-    try (DefaultKubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
+    try (KubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
         com.codahale.metrics.Timer.Context context = timer.time()) {
-      CustomResourceDefinitionContext crdContext = KubernetesHelper.getSparkApplicationCrdContext();
+      MixedOperation<SparkApplication, SparkApplicationResourceList, Resource<SparkApplication>>
+          sparkApplicationClient =
+              client.resources(SparkApplication.class, SparkApplicationResourceList.class);
 
-      SparkApplicationResource sparkApplication =
-          client
-              .customResources(
-                  crdContext,
-                  SparkApplicationResource.class,
-                  SparkApplicationResourceList.class,
-                  SparkApplicationResourceDoneable.class)
+      SparkApplication sparkApplication =
+          sparkApplicationClient
               .inNamespace(sparkCluster.getSparkApplicationNamespace())
               .withName(submissionId)
               .get();
+
       context.stop();
       if (sparkApplication == null) {
         throw new WebApplicationException(
@@ -629,10 +706,22 @@ public class ApplicationSubmissionRest extends RestBase {
       GetSubmissionStatusResponse response = new GetSubmissionStatusResponse();
       response.copyFrom(sparkApplication);
 
-      if (!StringUtils.isEmpty(sparkCluster.getSparkUIUrl())
-          && SparkConstants.RUNNING_STATE.equalsIgnoreCase(response.getApplicationState())) {
-        String url = ConfigUtil.getSparkUIUrl(sparkCluster, submissionId);
-        response.setSparkUIUrl(url);
+      if (!StringUtils.isEmpty(sparkCluster.getSparkUIUrl())) {
+        if (SparkConstants.RUNNING_STATE.equalsIgnoreCase(response.getApplicationState())
+            || SparkConstants.SPOT_TIMEOUT_STATE.equalsIgnoreCase(response.getApplicationState())) {
+          String url = ConfigUtil.getSparkUIUrl(sparkCluster, submissionId);
+          response.setSparkUIUrl(url);
+        }
+
+        if ((SparkConstants.COMPLETED_STATE.equalsIgnoreCase(response.getApplicationState())
+                || SparkConstants.FAILED_STATE.equalsIgnoreCase(response.getApplicationState()))
+            && appConfig.getSparkHistoryDns() != null
+            && response.getSparkApplicationId() != null) {
+          String url =
+              ConfigUtil.getSparkHistoryUrl(
+                  appConfig.getSparkHistoryDns(), response.getSparkApplicationId());
+          response.setSparkUIUrl(url);
+        }
       }
 
       // add more information regarding max running time
@@ -666,6 +755,21 @@ public class ApplicationSubmissionRest extends RestBase {
           }
         }
       }
+
+      // add more information regarding spot timeout
+      String extraSpotTimeoutMessage = "";
+      if (SPOT_TIMEOUT.equals(response.getApplicationState())) {
+        String spotTimeoutMillisLabel =
+            sparkApplication.getMetadata().getLabels().get(Constants.SPOT_TIMEOUT_LABEL);
+        long spotTimeoutMillisSetting = Long.parseLong(spotTimeoutMillisLabel);
+        extraSpotTimeoutMessage =
+            String.format(
+                "(warning: application is configured with spot timeout: %s millis,"
+                    + " and running time has exceed it, please consider kill it and retry "
+                    + "on On-Demand instances by setting spot-instance to False )",
+                spotTimeoutMillisSetting);
+      }
+
       if (extraMessage != null && !extraMessage.isEmpty()) {
         String consolidatedMessage = response.getApplicationErrorMessage();
         if (consolidatedMessage == null) {
@@ -674,9 +778,13 @@ public class ApplicationSubmissionRest extends RestBase {
           consolidatedMessage = consolidatedMessage + " ";
         }
         consolidatedMessage = consolidatedMessage + extraMessage;
+
+        if (extraSpotTimeoutMessage != null && !extraSpotTimeoutMessage.isEmpty()) {
+          consolidatedMessage = consolidatedMessage + extraSpotTimeoutMessage;
+        }
+
         response.setApplicationErrorMessage(consolidatedMessage);
       }
-
       return response;
     }
   }
@@ -715,8 +823,8 @@ public class ApplicationSubmissionRest extends RestBase {
     requestCounters.increment(
         REQUEST_METRIC_NAME, Tag.of("name", "get_driver"), Tag.of("user", user.getName()));
 
-    AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
-    SparkApplicationResource sparkApplicationResource = getSparkApplicationResource(submissionId);
+    VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
+    SparkApplication sparkApplicationResource = getSparkApplicationResource(submissionId);
     if (sparkApplicationResource.getStatus() == null
         || sparkApplicationResource.getStatus().getDriverInfo() == null) {
       return new GetDriverInfoResponse();
@@ -770,8 +878,7 @@ public class ApplicationSubmissionRest extends RestBase {
         Tag.of("name", "describe_application"),
         Tag.of("user", user.getName()));
 
-    final SparkApplicationResource sparkApplicationResource =
-        getSparkApplicationResource(submissionId);
+    final SparkApplication sparkApplicationResource = getSparkApplicationResource(submissionId);
     SparkApplicationSpec sparkApplicationSpec =
         removeEnvFromSpec(sparkApplicationResource.getSpec());
 
@@ -789,7 +896,7 @@ public class ApplicationSubmissionRest extends RestBase {
     }
     final String sparkApplicationSpecYaml = yaml;
 
-    AppConfig.SparkCluster sparkCluster = getSparkCluster(submissionId);
+    VirtualSparkClusterSpec sparkCluster = getSparkCluster(submissionId);
     List<Event> sparkApplicationEvents = getEvents(sparkCluster, submissionId);
 
     String driverName = String.format("%s-driver", submissionId);
@@ -814,7 +921,7 @@ public class ApplicationSubmissionRest extends RestBase {
                         outputStream,
                         String.format(
                             "%s %s %s",
-                            event.getLastTimestamp(), event.getReason(), event.getMessage()));
+                            event.getEventTime().getTime(), event.getReason(), event.getMessage()));
                   }
                   outputStream.flush();
 
@@ -824,7 +931,7 @@ public class ApplicationSubmissionRest extends RestBase {
                         outputStream,
                         String.format(
                             "%s %s %s",
-                            event.getLastTimestamp(), event.getReason(), event.getMessage()));
+                            event.getEventTime().getTime(), event.getReason(), event.getMessage()));
                   }
                   outputStream.flush();
 
@@ -859,14 +966,14 @@ public class ApplicationSubmissionRest extends RestBase {
     checkRateForListSubmissions("mySubmissions");
 
     List<SubmissionSummary> submissionList = new ArrayList<>();
-    for (AppConfig.SparkCluster sparkCluster : getSparkClusters()) {
+    for (VirtualSparkClusterSpec sparkCluster : getSparkClusters()) {
       SparkApplicationResourceList list =
           getSparkApplicationResourcesByUser(sparkCluster, user.getName());
-      List<SparkApplicationResource> sparkApplicationResources = list.getItems();
+      List<SparkApplication> sparkApplicationResources = list.getItems();
       if (sparkApplicationResources != null) {
-        for (SparkApplicationResource sparkApplicationResource : sparkApplicationResources) {
+        for (SparkApplication sparkApplication : sparkApplicationResources) {
           SubmissionSummary submission = new SubmissionSummary();
-          submission.copyFrom(sparkApplicationResource, sparkCluster, getAppConfig());
+          submission.copyFrom(sparkApplication, sparkCluster, getAppConfig());
           submissionList.add(submission);
         }
       }
@@ -876,19 +983,22 @@ public class ApplicationSubmissionRest extends RestBase {
     return response;
   }
 
-  protected List<Event> getEvents(AppConfig.SparkCluster sparkCluster, String objectName) {
+  protected List<Event> getEvents(VirtualSparkClusterSpec sparkCluster, String objectName) {
     Map<String, String> fields = new HashMap<>();
     fields.put("involvedObject.name", objectName);
     com.codahale.metrics.Timer timer =
         registry.timer(this.getClass().getSimpleName() + ".getEvents.k8s-time");
-    try (DefaultKubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
+    try (KubernetesClient client = KubernetesHelper.getK8sClient(sparkCluster);
         com.codahale.metrics.Timer.Context context = timer.time()) {
+
       EventList eventList =
           client
+              .v1()
               .events()
               .inNamespace(sparkCluster.getSparkApplicationNamespace())
               .withFields(fields)
               .list();
+
       context.stop();
       if (eventList == null) {
         return Collections.EMPTY_LIST;
@@ -978,6 +1088,17 @@ public class ApplicationSubmissionRest extends RestBase {
                   instances, MAX_EXECUTOR_INSTANCES),
               Response.Status.BAD_REQUEST);
         }
+      }
+    }
+  }
+
+  private void validateGpuRequest(SubmitApplicationRequest request, String queue) {
+    if (request.getExecutor().getGpu() != null) {
+      if (!appConfig.getQueueConfigs().containsKey(queue)
+          || !appConfig.getQueueConfigs().get(queue).getSupportGpu()) {
+        String errMsg = String.format("Queue %s doesn't support GPU", queue);
+        logger.error(errMsg);
+        throw new WebApplicationException(errMsg);
       }
     }
   }

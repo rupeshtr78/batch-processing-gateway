@@ -164,6 +164,50 @@ public class LogDao {
     return queryResult;
   }
 
+  public String getUserFromSubmissionId(String submissionId) {
+
+    return timerMetrics.record(
+            () -> getUserFromSubmissionIdImpl(submissionId),
+            DB_TIMER_METRIC_NAME,
+            Tag.of(OPERATION_TAG, QUERY_SUBMISSION_OPERATION));
+  }
+  private String getUserFromSubmissionIdImpl(String submissionId) {
+    String queryResult = "";
+
+    String sql =
+            String.format(
+                    "SELECT user from %s.application_submission where submission_id = ?", dbName);
+
+    try (PreparedStatement statement = dbConnection.getConnection().prepareStatement(sql)) {
+      statement.setString(1, submissionId);
+      try (ResultSet resultSet = statement.executeQuery()) {
+        boolean seenResult = false;
+        while (resultSet.next()) {
+          if (seenResult) {
+            logger.warn(String.format("Found multiple records for the same submissionId: %s"), submissionId);
+            queryResult = "";
+            break;
+          }
+
+          Object object = resultSet.getObject("user");
+          if (object == null) {
+            queryResult = "";
+          } else {
+            queryResult = object.toString();
+          }
+          seenResult = true;
+        }
+      }
+    } catch (Throwable ex) {
+      logger.warn(String.format("Failed to execute SQL query: %s", sql), ex);
+      failureMetrics.increment(
+              DB_FAILURE_METRIC_NAME,
+              Tag.of(OPERATION_TAG, QUERY_SUBMISSION_OPERATION),
+              Tag.of(EXCEPTION_TAG, ex.getClass().getSimpleName()));
+    }
+    return queryResult;
+  }
+
   public void logApplicationSubmission(
       String submissionId, String user, SubmitApplicationRequest submission) {
     if (bypassLog) {
@@ -190,8 +234,8 @@ public class LogDao {
       String submissionId, String user, SubmitApplicationRequest submission, String requestBody) {
     String sql =
         String.format(
-            "INSERT INTO %s.application_submission(submission_id, `user`, spark_version,"
-                + " request_body,queue) VALUES (?, ?, ?, ?,?) ON DUPLICATE KEY UPDATE `user`=?,"
+            "INSERT INTO %s.application_submission(submission_id, user, spark_version,"
+                + " request_body,queue) VALUES (?, ?, ?, ?,?) ON DUPLICATE KEY UPDATE user=?,"
                 + " spark_version=?, request_body=?, queue=?",
             dbName);
 
@@ -447,7 +491,7 @@ public class LogDao {
         String.format(
             "CREATE TABLE IF NOT EXISTS %s.application_submission (\n"
                 + "    submission_id VARCHAR(255) NOT NULL PRIMARY KEY,\n"
-                + "    `user` VARCHAR(255) NULL,\n"
+                + "    user VARCHAR(255) NULL,\n"
                 + "    app_name VARCHAR(255) NULL,\n"
                 + "    dag_name VARCHAR(255) NULL,\n"
                 + "    task_name VARCHAR(255) NULL,\n"
@@ -464,7 +508,17 @@ public class LogDao {
                 + "    number_executor SMALLINT,\n"
                 + "    executor_core SMALLINT,\n"
                 + "    executor_memory_mb INT,\n"
-                + "    cost DECIMAL(10,2)\n"
+                + "    cost DECIMAL(10,2) unsigned,\n"
+                + "    INDEX (user),\n"
+                + "    INDEX (spark_version),\n"
+                + "    INDEX (app_id),\n"
+                + "    INDEX (status),\n"
+                + "    INDEX (app_name),\n"
+                + "    INDEX (dag_name),\n"
+                + "    INDEX (created_time),\n"
+                + "    INDEX (finished_time), \n"
+                + "    INDEX (start_time), \n"
+                + "    INDEX (cost)\n"
                 + ");",
             dbName);
     try {
@@ -481,8 +535,10 @@ public class LogDao {
             "CREATE TABLE IF NOT EXISTS %s.logindex (\n"
                 + "    logs3key VARCHAR(500) NOT NULL PRIMARY KEY,\n"
                 + "    date date NOT NULL,\n"
-                + "    \"hour\" SMALLINT NOT NULL,\n"
-                + "    containerId VARCHAR(60) NOT NULL\n"
+                + "    hour TINYINT NOT NULL,\n"
+                + "    containerId VARCHAR(60) NOT NULL,\n"
+                + "    INDEX (date),\n"
+                + "    INDEX (containerId)\n"
                 + ");",
             dbName);
     try {
@@ -536,7 +592,7 @@ public class LogDao {
               String.format(
                   "SELECT *, TIMESTAMPDIFF(second,created_time,NOW()) AS duration FROM"
                       + " %s.application_submission WHERE created_time > (NOW() + CAST(? AS"
-                      + " INTEGER) * INTERVAL '1' DAY) AND status = ? AND `user` = ? ORDER BY"
+                      + " INTEGER) * INTERVAL '1' DAY) AND status = ? AND user = ? ORDER BY"
                       + " created_time DESC LIMIT ?",
                   dbName);
         } else {
@@ -544,7 +600,7 @@ public class LogDao {
               String.format(
                   "SELECT *, TIMESTAMPDIFF(second,created_time,finished_time) AS duration FROM"
                       + " %s.application_submission WHERE created_time > (NOW() + CAST(? AS"
-                      + " INTEGER) * INTERVAL '1' DAY) AND status = ? AND `user` = ? ORDER BY"
+                      + " INTEGER) * INTERVAL '1' DAY) AND status = ? AND user = ? ORDER BY"
                       + " created_time DESC LIMIT ?",
                   dbName);
         }

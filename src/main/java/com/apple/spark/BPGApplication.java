@@ -22,16 +22,10 @@ package com.apple.spark;
 import static com.apple.spark.core.Constants.QUEUE_INFO;
 import static com.apple.spark.core.Constants.SERVICE_ABBR;
 
-import com.apple.spark.core.ApplicationMonitor;
-import com.apple.spark.core.BPGStatsdConfig;
-import com.apple.spark.core.Constants;
-import com.apple.spark.core.ThrowableExceptionMapper;
+import com.apple.spark.core.*;
+import com.apple.spark.crd.VirtualSparkClusterSpec;
 import com.apple.spark.health.BPGHealthCheck;
-import com.apple.spark.rest.AdminRest;
-import com.apple.spark.rest.ApplicationGetLogRest;
-import com.apple.spark.rest.ApplicationSubmissionRest;
-import com.apple.spark.rest.HealthcheckRest;
-import com.apple.spark.rest.S3Rest;
+import com.apple.spark.rest.*;
 import com.apple.spark.security.User;
 import com.apple.spark.security.UserNameAuthFilter;
 import com.apple.spark.security.UserNameBasicAuthenticator;
@@ -52,7 +46,6 @@ import io.micrometer.core.instrument.Tag;
 import io.swagger.v3.jaxrs2.integration.resources.OpenApiResource;
 import io.swagger.v3.oas.integration.SwaggerConfiguration;
 import io.swagger.v3.oas.models.OpenAPI;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -68,13 +61,19 @@ public class BPGApplication extends Application<AppConfig> {
 
   private static final String MONITOR_APPLICATION_SYSTEM_PROPERTY_NAME = "monitorApplication";
 
+  private static final String NOTARY_APPLICATION_SYSTEM_PROPERTY_NAME = "notaryApplication";
+  private final boolean notaryApplication;
+
+  private String NOTARY_APPLICATION_CONTEXT_PATH = "/notary";
+
   private final boolean monitorApplication;
 
   public BPGApplication() {
-    this(false);
+    this(false, false);
   }
 
-  public BPGApplication(boolean monitorApplication) {
+  public BPGApplication(boolean notaryApplication, boolean monitorApplication) {
+    this.notaryApplication = notaryApplication;
     this.monitorApplication = monitorApplication;
   }
 
@@ -85,7 +84,10 @@ public class BPGApplication extends Application<AppConfig> {
     String value = System.getProperty(MONITOR_APPLICATION_SYSTEM_PROPERTY_NAME);
     boolean monitorApplication = value != null && value.equalsIgnoreCase("true");
 
-    new BPGApplication(monitorApplication).run(args);
+    String notaryAppProperty = System.getProperty(NOTARY_APPLICATION_SYSTEM_PROPERTY_NAME);
+    boolean notaryApplication = notaryAppProperty != null && notaryAppProperty.equalsIgnoreCase("true");
+
+    new BPGApplication(notaryApplication, monitorApplication).run(args);
   }
 
   @Override
@@ -98,6 +100,12 @@ public class BPGApplication extends Application<AppConfig> {
 
   @Override
   public void run(final AppConfig configuration, final Environment environment) {
+    String applicationContextPath = configuration.getApplicationContextPath();
+    if (applicationContextPath == null || applicationContextPath.isEmpty()) {
+      applicationContextPath = Constants.DEFAULT_APPLICATION_CONTEXT_PATH;
+
+    }
+    environment.getApplicationContext().setContextPath(applicationContextPath);
 
     // Get the application's metric registry
     MetricRegistry registry = environment.metrics();
@@ -122,6 +130,18 @@ public class BPGApplication extends Application<AppConfig> {
 
     final HealthcheckRest healthcheckRest = new HealthcheckRest(configuration, meterRegistry);
     environment.jersey().register(healthcheckRest);
+
+
+    if ( notaryApplication ) {
+      String notaryContextPath = configuration.getApplicationContextPath();
+      if (notaryContextPath == null || applicationContextPath.isEmpty()) {
+        notaryContextPath = NOTARY_APPLICATION_CONTEXT_PATH;
+
+      }
+      environment.getApplicationContext().setContextPath(notaryContextPath);
+      final NotaryRest notaryRest = new NotaryRest(configuration, meterRegistry);
+      environment.jersey().register(notaryRest);
+    }
 
     environment.jersey().register(new ThrowableExceptionMapper(environment.metrics()));
 
@@ -154,8 +174,8 @@ public class BPGApplication extends Application<AppConfig> {
     // To use @Auth to inject a User Principal type into REST resource
     environment.jersey().register(new AuthValueFactoryProvider.Binder<>(User.class));
 
-    final BPGHealthCheck healthCheck = new BPGHealthCheck(configuration.getSparkClusters());
-    environment.healthChecks().register("sparkClusters", healthCheck);
+    final BPGHealthCheck healthCheck = new BPGHealthCheck();
+    environment.healthChecks().register("bpgHealthCheck", healthCheck);
 
     // Support OpenAPI spec for all components under com.apple.spark.rest
     OpenAPI openAPI = new OpenAPI();
@@ -218,20 +238,19 @@ public class BPGApplication extends Application<AppConfig> {
   private void sendQueueInfoMetrics(
       AppConfig configuration, CounterMetricContainer periodicMetrics) {
 
-    if (configuration.getSparkClusters() != null) {
-      for (AppConfig.SparkCluster cluster : configuration.getSparkClusters()) {
-        List<String> sparkVersions =
-            cluster.getSparkVersions() == null ? new ArrayList<>() : cluster.getSparkVersions();
-        List<String> queues = cluster.getQueues() == null ? new ArrayList<>() : cluster.getQueues();
-        for (String sparkVersion : sparkVersions) {
-          for (String queue : queues) {
-            periodicMetrics.increment(
-                QUEUE_INFO,
-                Tag.of("eks", cluster.getEksCluster()),
-                Tag.of("spark_cluster_id", cluster.getId()),
-                Tag.of("spark_version", sparkVersion),
-                Tag.of("queue", queue));
-          }
+    for (VirtualSparkClusterSpec cluster :
+        SparkClusterHelper.concatenateSparkClusters(configuration)) {
+      List<String> sparkVersions =
+          cluster.getSparkVersions() == null ? new ArrayList<>() : cluster.getSparkVersions();
+      List<String> queues = cluster.getQueues() == null ? new ArrayList<>() : cluster.getQueues();
+      for (String sparkVersion : sparkVersions) {
+        for (String queue : queues) {
+          periodicMetrics.increment(
+              QUEUE_INFO,
+              Tag.of("eks", cluster.getEksCluster()),
+              Tag.of("spark_cluster_id", cluster.getId()),
+              Tag.of("spark_version", sparkVersion),
+              Tag.of("queue", queue));
         }
       }
     }
