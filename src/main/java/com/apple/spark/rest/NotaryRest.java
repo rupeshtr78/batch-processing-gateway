@@ -1,11 +1,10 @@
-package com.apple.spark.rest;
+package com.apple.spark.appleinternal;
 
 import com.apple.spark.AppConfig;
 import com.apple.spark.api.NotaryValidateResponse;
-import com.apple.spark.appleinternal.NotaryValidateRequestBody;
 import com.apple.spark.core.LogDao;
-import com.apple.turi.notary.client.exception.NotaryException;
-import com.apple.turi.notary.openapi.invoker.ApiException;
+import com.apple.spark.rest.RestBase;
+import com.codahale.metrics.annotation.Timed;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,8 +19,8 @@ import javax.naming.ldap.LdapContext;
 import javax.ws.rs.*;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import java.io.IOException;
-import java.security.GeneralSecurityException;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.*;
 
 
@@ -30,11 +29,16 @@ import java.util.*;
 //   @TODO validate endpoint get user from LogDao.
 //   @TODO add other response statuses
 //   @TODO memory cache to avoid hitting mysql database too heavily
+//   200 (OK): Request was processed successfully and response is provided
+//   400 (Malformed Request): Request arguments are invalid or lack required fields
+//   401 (Unauthorized access): Identity of request is not valid
 
 import static com.apple.spark.core.Constants.LDAP_ENDPOINT;
+import static com.apple.spark.core.SparkConstants.RUNNING_STATE;
+import static com.apple.spark.core.SparkConstants.SUBMITTED_STATE;
 
 
-@Path( "/actor-assumablity-check" )
+@Path("/actor-assumablity-check")
 @Consumes({MediaType.APPLICATION_JSON, "text/yaml", MediaType.WILDCARD})
 @Produces(MediaType.APPLICATION_JSON)
 public class NotaryRest extends RestBase {
@@ -60,18 +64,10 @@ public class NotaryRest extends RestBase {
         this.logDao = new LogDao(dbConnectionString, dbUser, dbPassword, dbName, meterRegistry);
     }
 
-//    @Path("/actor-assumablity-check")
 
     @POST
-    public NotaryValidateResponse validateNotaryIdentity(NotaryValidateRequestBody validateRequestBody)
-            throws GeneralSecurityException, NotaryException, IOException, ApiException {
-
-//IDMS we regiaster notary app
-//        "actorAprn": "aprn:apple:turi::bpg-siri-aws-test:task:c0502-a82a388c13d74b668a3122bf4975b5db",
-//        "assumeAprn": "aprn:apple:turi::notary:person:2700862372",
-//        "audience": ["aprn:apple:turi::notary:application-group:turi-platform","aprn:apple:turi::notary:application-group:polymer"],
-//        "sourceIp": ["172.19.198.80"],
-//        "claims": {}
+    @Timed
+    public NotaryValidateResponse validateNotaryIdentity(NotaryValidateRequestBody validateRequestBody) {
 
         NotaryValidateResponse response = new NotaryValidateResponse();
 
@@ -87,18 +83,9 @@ public class NotaryRest extends RestBase {
                         Response.Status.BAD_REQUEST);
         }
 
+        Boolean validUserIdentity = checkUserIdentity(actorAprn, assumeAprn);
 
-        String submissionId = getIdentityFromAprn(actorAprn);
-        String actorAssumePersonId = getIdentityFromAprn(assumeAprn);
-
-        String sparkJobUsername = getUserFromSubmissionIdFromDB(submissionId);
-        logger.debug("Spark job Username from skatedb: " + sparkJobUsername);
-
-        String assumeIdentiyDsid = getDsidFromAcUserName(sparkJobUsername);
-        logger.debug("Dsid of Username from skatedb: " + assumeIdentiyDsid);
-
-
-        if (Objects.equals(assumeIdentiyDsid, actorAssumePersonId)) {
+        if (validUserIdentity) {
             response.setAssumable(Boolean.TRUE);
             response.setAudience(List.of("aprn:apple:turi::notary:application-group:turi-platform"));
             response.setClaims(claims);
@@ -115,12 +102,37 @@ public class NotaryRest extends RestBase {
 
     }
 
+    private Boolean checkUserIdentity(String actorAprn, String assumeAprn ) {
+        String submissionId = getIdentityFromAprn(actorAprn);
+        String actorAssumePersonId = getIdentityFromAprn(assumeAprn);
+        Boolean isValidIdentity = false;
+
+        String sparkJobUser;
+        try {
+            sparkJobUser = getUserFromDb(submissionId);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        logger.debug("Spark job Username from skatedb: " + sparkJobUser);
+
+        String sparkUserDsid = getDsidFromAcUserName(sparkJobUser);
+        logger.debug("Dsid of Username from skatedb: " + sparkUserDsid);
+
+        if (Objects.equals(sparkUserDsid, actorAssumePersonId)) {
+            isValidIdentity = true;
+        } else {
+            logger.info(String.format("Spark job User %s does not match Notary Identity %s", sparkUserDsid, actorAssumePersonId));
+        }
+
+        return isValidIdentity;
+    }
+
     private String getIdentityFromAprn(String notaryIdentityAprn){
 
             String output = "";
             try {
                 if (notaryIdentityAprn.isEmpty() || notaryIdentityAprn.isBlank()) {
-                    logger.error("Error while parsing empty aprn string");
+                    logger.error("Error Empty aprn string");
                   } else {
                     int aprnIndex = notaryIdentityAprn.lastIndexOf(':') + 1;
                     output =  notaryIdentityAprn.substring(aprnIndex);
@@ -137,13 +149,33 @@ public class NotaryRest extends RestBase {
     private String getUserFromSubmissionIdFromDB(String submissionId) {
         String user = "";
         try {
-            user = logDao.getUserFromSubmissionId(submissionId);
+            user = logDao.getUserStatusFromSubmissionId(submissionId);
         } catch (Exception e) {
             logger.warn(
                     String.format("Could not get user for submission_id: %s from database", submissionId), e);
         }
         return user;
     }
+
+
+    private String getUserFromDb(String submissionId) throws SQLException {
+        String user = null;
+
+        String sql =
+                String.format(
+                        "SELECT user, status from %s.application_submission where submission_id = ?", submissionId);
+
+        ResultSet queryResult = logDao.dbQuery(sql);
+        String status = queryResult.getString("status");
+
+        if (status.equals(RUNNING_STATE) || status.equals(SUBMITTED_STATE)) {
+            user = queryResult.getString("user");
+        }
+
+        return user;
+
+    }
+
 
     /**
      * Query Ldap and get the DSID of a AppleConnect userName. This method is needed since airflow
@@ -190,6 +222,10 @@ public class NotaryRest extends RestBase {
 
 
 }
+
+
+
+
 
 
 
